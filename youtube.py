@@ -22,17 +22,53 @@ from PySide6.QtWidgets import (
 from yt_dlp import YoutubeDL
 
 
+def find_ffmpeg_location() -> Path | None:
+    """Возвращает папку с ffmpeg/ffprobe для yt-dlp (PATH, рядом с exe, _MEIPASS)."""
+    candidates: list[Path] = []
+
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        candidates.extend([exe_dir, exe_dir / "bin"])
+
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            meipass_dir = Path(meipass)
+            candidates.extend([meipass_dir, meipass_dir / "bin"])
+
+    candidates.append(Path.cwd())
+    candidates.append(Path.cwd() / "bin")
+
+    for base in candidates:
+        ffmpeg_bin = base / "ffmpeg.exe"
+        ffprobe_bin = base / "ffprobe.exe"
+        if ffmpeg_bin.exists() and ffprobe_bin.exists():
+            return base
+
+    # fallback на системный PATH
+    try:
+        subprocess.run(
+            ["ffmpeg", "-version"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return None
+    except Exception:
+        return None
+
+
 class DownloaderWorker(QObject):
     progress_changed = Signal(int)
     log_message = Signal(str)
     finished = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, url: str, output_dir: Path, mode: str):
+    def __init__(self, url: str, output_dir: Path, mode: str, ffmpeg_location: Path | None):
         super().__init__()
         self.url = url.strip()
         self.output_dir = output_dir
         self.mode = mode
+        self.ffmpeg_location = ffmpeg_location
 
     def run(self) -> None:
         if not self.url:
@@ -47,6 +83,10 @@ class DownloaderWorker(QObject):
             "noprogress": True,
             "quiet": True,
         }
+
+        if self.ffmpeg_location:
+            ydl_opts["ffmpeg_location"] = str(self.ffmpeg_location)
+            self.log_message.emit(f"ffmpeg: {self.ffmpeg_location}")
 
         if self.mode == "audio":
             ydl_opts.update(
@@ -64,8 +104,6 @@ class DownloaderWorker(QObject):
         else:
             ydl_opts.update(
                 {
-                    # Делаем упор на максимально совместимый mp4 для Windows-плееров:
-                    # H.264 (avc1) + AAC (mp4a) приоритетнее, чем AV1/VP9.
                     "format": (
                         "bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/"
                         "best[vcodec^=avc1][ext=mp4]/best[ext=mp4]/best"
@@ -107,6 +145,7 @@ class MainWindow(QMainWindow):
 
         self.thread: QThread | None = None
         self.worker: DownloaderWorker | None = None
+        self.ffmpeg_location = find_ffmpeg_location()
 
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("Вставьте ссылку на YouTube видео")
@@ -155,28 +194,33 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.log_box)
 
     def _check_dependencies(self) -> None:
-        missing = []
+        if self._is_ffmpeg_available():
+            return
 
-        if not self._is_ffmpeg_available():
-            missing.append("ffmpeg (бинарник)")
-
-        if missing:
-            QMessageBox.warning(
-                self,
-                "Зависимости",
-                "Не найдены: " + ", ".join(missing) + "\n"
-                "Установите их и добавьте ffmpeg в PATH.",
-            )
+        QMessageBox.warning(
+            self,
+            "Зависимости",
+            "Не найден ffmpeg/ffprobe.\n"
+            "Для portable-сборки положите ffmpeg.exe и ffprobe.exe рядом с .exe или в папку bin.",
+        )
 
     def _is_ffmpeg_available(self) -> bool:
         try:
             ffmpeg.probe
-            subprocess.run(
-                ["ffmpeg", "-version"],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            if self.ffmpeg_location:
+                subprocess.run(
+                    [str(self.ffmpeg_location / "ffmpeg.exe"), "-version"],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                subprocess.run(
+                    ["ffmpeg", "-version"],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
             return True
         except Exception:
             return False
@@ -200,7 +244,7 @@ class MainWindow(QMainWindow):
         self.download_button.setEnabled(False)
 
         self.thread = QThread()
-        self.worker = DownloaderWorker(url, output_dir, mode)
+        self.worker = DownloaderWorker(url, output_dir, mode, self.ffmpeg_location)
         self.worker.moveToThread(self.thread)
 
         self.thread.started.connect(self.worker.run)
